@@ -166,7 +166,7 @@ def get_nocc(mp):
     frozen = mp.frozen
     if mp._nocc is not None:
         return mp._nocc
-    elif frozen is None:
+    elif not frozen:
         nocca = numpy.count_nonzero(mp.mo_occ[0] > 0)
         noccb = numpy.count_nonzero(mp.mo_occ[1] > 0)
     elif isinstance(frozen, (int, numpy.integer)):
@@ -191,7 +191,7 @@ def get_nmo(mp):
     frozen = mp.frozen
     if mp._nmo is not None:
         return mp._nmo
-    elif frozen is None:
+    elif not frozen:
         nmoa = mp.mo_occ[0].size
         nmob = mp.mo_occ[1].size
     elif isinstance(frozen, (int, numpy.integer)):
@@ -220,7 +220,7 @@ def get_frozen_mask(mp):
     if mp._nmo is not None:
         moidxa[mp._nmo[0]:] = False
         moidxb[mp._nmo[1]:] = False
-    elif frozen is None:
+    elif not frozen:
         pass
     elif isinstance(frozen, (int, numpy.integer)):
         moidxa[:frozen] = False
