@@ -33,7 +33,7 @@ def kernel(gfccsd, eris=None):
     u = np.concatenate([uh, up], axis=1).T.conj()
 
     norm = np.linalg.norm(u, axis=0, keepdims=True)
-    norm[np.abs(norm) == 0] = 1e-20
+    norm[np.abs(norm) < 1e-14] = 1e-14
     u /= norm
 
     p = np.eye(e.size) - np.dot(u, u.T.conj())
@@ -267,7 +267,7 @@ class GFCCSD(lib.StreamObject):
             self.nmom = (nmom, nmom)
         else:
             self.nmom = nmom
-        self.weight_tol = 1e-8
+        self.weight_tol = 1e-5
         self.e = None
         self.c = None
         self.t1 = None
@@ -284,6 +284,8 @@ class GFCCSD(lib.StreamObject):
         log.info("nmom = %s", self.nmom)
         log.info("nmo = %s", self.nmo)
         log.info("nocc = %s", self.nocc)
+        log.info("weight_tol = %s", self.weight_tol)
+        log.info("chkfile = %s", self.chkfile)
 
     def _finalize(self):
         cpt = chempot.binsearch_chempot((self.e, self.c), self.nmo, self.nocc*2)[0]
@@ -572,6 +574,77 @@ class GFCCSD(lib.StreamObject):
             return None
         cpt = chempot.binsearch_chempot((self.e, self.c), self.nmo, self.nocc*2)[0]
         return GreensFunction(e, c[:self.nmo], chempot=cpt)
+
+
+class GFADC(GFCCSD):
+    """Green's function solver for algebraic diagrammatic construction.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.t1 = self._adc.t1[0]
+        self.t2 = self._adc.t2[0]
+
+    @property
+    def _adc(self):
+        return self._cc
+
+    def eomip_method(self):
+        from pyscf.adc.radc import RADCIP
+        eom = RADCIP(self._adc)
+        eris = eom.transform_integrals()
+        M = eom.get_imds(eris=eris)
+        fake = lambda: None
+        fake.t1, fake.t2 = self._adc.t1[0], self._adc.t2[0]
+        fake.get_diag = lambda imds: eom.get_diag(M)
+        fake.matvec = lambda v, *args: (eom.matvec(M, eris))(v)
+        fake.amplitudes_to_vector = lambda r1, r2: np.concatenate([r1.ravel(), r2.ravel()], axis=0)
+        return fake
+
+    def eomea_method(self):
+        from pyscf.adc.radc import RADCEA
+        eom = RADCEA(self._adc)
+        eris = eom.transform_integrals()
+        M = eom.get_imds(eris=eris)
+        fake = lambda: None
+        fake.t1, fake.t2 = self._adc.t1[0], self._adc.t2[0]
+        fake.get_diag = lambda imds: eom.get_diag(M)
+        fake.matvec = lambda v, *args: (eom.matvec(M, eris))(v)
+        fake.amplitudes_to_vector = lambda r1, r2: np.concatenate([r1.ravel(), r2.ravel()], axis=0)
+        return fake
+
+    def make_imds(self, eris=None, ip=True, ea=True):
+        return None
+
+    def kernel(self, t1=None, t2=None, l1=None, l2=None, eris=None):
+        if self.verbose >= logger.WARN:
+            self.check_sanity()
+        self.dump_flags()
+
+        e, c = self.e, self.c = kernel(self, eris=eris)
+
+        if self.chkfile is not None:
+            self.dump_chk()
+
+        self._finalize()
+
+        return self.e, self.c
+
+    ip_adc = ipadc = GFCCSD.ipccsd
+    ea_adc = eaadc = GFCCSD.eaccsd
+
+    get_b_hole = get_b_hole
+    get_b_part = get_b_part
+    get_e_hole = get_b_hole
+    get_e_part = get_b_part
+
+    @property
+    def nmo(self):
+        return self._adc._nmo
+
+    @property
+    def nocc(self):
+        return self._adc._nocc
 
 
 
