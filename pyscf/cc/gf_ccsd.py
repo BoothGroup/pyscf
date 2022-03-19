@@ -15,18 +15,21 @@ except ImportError:
     dyson = None
 
 
-def kernel(gfccsd, eris=None):
+def kernel(gfccsd, th=None, tp=None, eris=None):
     """Run GF-CCSD for the IP and EA excitations up to a given
     number of moments of the Green's function.
     """
 
-    imds = gfccsd.make_imds(eris=eris)
+    if th is None or tp is None:
+        imds = gfccsd.make_imds(eris=eris)
 
-    th = gfccsd.get_ip_moments(imds=imds)
+    if th is None:
+        th = gfccsd.get_ip_moments(imds=imds)
     eh, uh = gfccsd.eigh_moments(th, gfccsd.nmom[0])
     eh *= -1
 
-    tp = gfccsd.get_ea_moments(imds=imds)
+    if tp is None:
+        tp = gfccsd.get_ea_moments(imds=imds)
     ep, up = gfccsd.eigh_moments(tp, gfccsd.nmom[1])
 
     e = np.concatenate([eh, ep])
@@ -338,25 +341,25 @@ class GFCCSD(lib.StreamObject):
         if imds is None:
             imds = self.make_imds(ea=False)
         diag = eom.get_diag(imds)
-        matvec = lambda v: eom.matvec(v, imds, diag)
+        matvec = lambda v: eom.l_matvec(v, imds, diag)
 
         if nmom is None:
             nmom = 2 * self.nmom[0] + 2
         moms = np.zeros((nmom, self.nmo, self.nmo))
 
         bras = [None] * self.nmo
-        for p in mpi_helper.nrange(self.nmo):
-            r1, r2 = self.get_e_hole(p)
-            bras[p] = eom.amplitudes_to_vector(r1, r2)
-
         for p in range(self.nmo):
             r1, r2 = self.get_b_hole(p)
+            bras[p] = eom.amplitudes_to_vector(r1, r2)
+
+        for p in mpi_helper.nrange(self.nmo):
+            r1, r2 = self.get_e_hole(p)
             ket = eom.amplitudes_to_vector(r1, r2)
 
             for n in range(nmom):
-                for q in mpi_helper.nrange(self.nmo):
+                for q in range(self.nmo):
                     bra = bras[q]
-                    moms[n, q, p] += np.dot(bra, ket)
+                    moms[n, p, q] += np.dot(bra, ket)
 
                 if (n+1) != nmom:
                     ket = matvec(ket)
@@ -380,25 +383,25 @@ class GFCCSD(lib.StreamObject):
         if imds is None:
             imds = self.make_imds(ip=False)
         diag = eom.get_diag(imds)
-        matvec = lambda v: eom.matvec(v, imds, diag)
+        matvec = lambda v: eom.l_matvec(v, imds, diag)
 
         if nmom is None:
             nmom = 2 * self.nmom[1] + 2
         moms = np.zeros((nmom, self.nmo, self.nmo))
 
         bras = [None] * self.nmo
-        for p in mpi_helper.nrange(self.nmo):
-            r1, r2 = self.get_e_part(p)
-            bras[p] = eom.amplitudes_to_vector(r1, r2)
-
         for p in range(self.nmo):
             r1, r2 = self.get_b_part(p)
+            bras[p] = eom.amplitudes_to_vector(r1, r2)
+
+        for p in mpi_helper.nrange(self.nmo):
+            r1, r2 = self.get_e_part(p)
             ket = eom.amplitudes_to_vector(r1, r2)
 
             for n in range(nmom):
-                for q in mpi_helper.nrange(self.nmo):
+                for q in range(self.nmo):
                     bra = bras[q]
-                    moms[n, q, p] += np.dot(bra, ket)
+                    moms[n, p, q] += np.dot(bra, ket)
 
                 if (n+1) != nmom:
                     ket = matvec(ket)
@@ -457,7 +460,7 @@ class GFCCSD(lib.StreamObject):
 
         return dm1
 
-    def kernel(self, t1=None, t2=None, l1=None, l2=None, eris=None):
+    def kernel(self, th=None, tp=None, t1=None, t2=None, l1=None, l2=None, eris=None):
         if self.verbose >= logger.WARN:
             self.check_sanity()
         self.dump_flags()
@@ -487,7 +490,7 @@ class GFCCSD(lib.StreamObject):
                     % (self._cc.__class__.__name__, self.__class__.__name__)
             )
 
-        e, c = self.e, self.c = kernel(self, eris=eris)
+        e, c = self.e, self.c = kernel(self, th=th, tp=tp, eris=eris)
 
         if self.chkfile is not None:
             self.dump_chk()
@@ -499,17 +502,17 @@ class GFCCSD(lib.StreamObject):
     def dump_chk(self, chkfile=None, key="gfccsd"):
         if chkfile is None:
             chkfile = self.chkfile
-        lib.chkfile.dump(chkfile, "gfccsd/e", self.e)
-        lib.chkfile.dump(chkfile, "gfccsd/c", self.c)
-        lib.chkfile.dump(chkfile, "gfccsd/nmom", np.array(self.nmom))
+        lib.chkfile.dump(chkfile, "%s/e" % key, self.e)
+        lib.chkfile.dump(chkfile, "%s/c" % key, self.c)
+        lib.chkfile.dump(chkfile, "%s/nmom" % key, np.array(self.nmom))
         return self
 
     def update_from_chk_(self, chkfile=None, key="gfccsd"):
         if chkfile is None:
             chkfile = self.chkfile
-        self.e = lib.chkfile.load(chkfile, "gfccsd/e")
-        self.c = lib.chkfile.load(chkfile, "gfccsd/c")
-        self.nmom = tuple(lib.chkfile.load(chkfile, "gfccsd/nmom"))
+        self.e = lib.chkfile.load(chkfile, "%s/e" % key)
+        self.c = lib.chkfile.load(chkfile, "%s/c" % key)
+        self.nmom = tuple(lib.chkfile.load(chkfile, "%s/nmom" % key))
         return self
 
     update = update_from_chk = update_from_chk_
