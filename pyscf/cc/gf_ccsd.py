@@ -4,15 +4,11 @@ moments of the similarity-transformed Hamiltonian.
 """
 
 import numpy as np
+from collections import defaultdict
 
 from pyscf import lib, cc
 from pyscf.lib import logger
 from pyscf.agf2 import mpi_helper, chempot, GreensFunction
-
-try:
-    import dyson
-except ImportError:
-    dyson = None
 
 
 def kernel(gfccsd, th=None, tp=None, eris=None):
@@ -147,6 +143,102 @@ def _kernel_dynamic(gfccsd, grid, eta=1e-2, eris=None, conv_tol=1e-6, max_cycle=
     return gf
 
 
+def mat_sqrt(m):
+    """Square root a matrix.
+    """
+
+    w, v = np.linalg.eigh(m)
+
+    mask = w >= 0.0
+    w, v = w[mask], v[:, mask]
+
+    return np.dot(v * w[None]**0.5, v.T)
+
+
+def mat_isqrt(m, check_null_space=False, tol=1e-14):
+    """Inverse square root of the non-null-space of a matrix.
+    """
+
+    w, v = np.linalg.eigh(m)
+
+    null_space = np.any(w < tol)
+    mask = w >= tol
+    w, v = w[mask], v[:, mask]
+
+    if check_null_space:
+        return np.dot(v * w[None]**-0.5, v.T), null_space
+    else:
+        return np.dot(v * w[None]**-0.5, v.T)
+
+
+def block_lanczos(t, nmom):
+    """Compute the on- and off-diagonal blocks from the moments.
+    """
+
+    nmo = t[0].shape[-1]
+
+    m = np.zeros((nmom+1, nmo, nmo))
+    b = np.zeros((nmom, nmo, nmo))
+    s = np.zeros_like(t)
+    c = defaultdict(lambda: np.zeros((nmo, nmo)))
+    c[0, 0] = np.eye(nmo)
+
+    bi = mat_isqrt(t[0])
+
+    for i in range(len(t)):
+        s[i] = np.linalg.multi_dot((bi, t[i], bi))
+
+    m[0] = s[1]
+
+    for i in range(nmom):
+        # Compute B_{i}
+        b2 = np.zeros((nmo, nmo))
+
+        for j in range(1, i+2):
+            for l in range(i+1):
+                b2 += np.linalg.multi_dot((c[i, l].T, s[j+l+1], c[i, j-1]))
+
+        b2 -= np.dot(m[i], m[i].T)
+        if i:
+            b2 -= np.dot(b[i-1], b[i-1].T).T
+
+        b[i] = mat_sqrt(b2)
+        binv, null = mat_isqrt(b2, check_null_space=True)
+
+        # Compute C_{i,n}
+        for j in range(1, i+2):
+            tmp = (
+                + c[i, j-1]
+                - np.dot(c[i, j], m[i])
+                - np.dot(c[i-1, j], b[i-1].T)
+            )
+            c[i+1, j] = np.dot(tmp, binv)
+
+        for j in range(i+2):
+            for l in range(i+2):
+                m[i+1] += np.linalg.multi_dot((c[i+1, l].T, s[j+l+1], c[i+1, j]))
+
+    return m, b
+
+
+def build_block_tridiagonal(m, b):
+    """Construct a block tridiagonal matrix from a list of on-diagonal
+    and off-diagonal blocks.
+    """
+
+    z = np.zeros_like(m[0])
+
+    h = np.block([[
+        m[i]   if i == j   else
+        b[j]   if j == i-1 else
+        b[i].T if i == j-1 else z
+        for j in range(len(m))]
+        for i in range(len(m))]
+    )
+
+    return h
+
+
 def get_b_hole(ccsd, orb):
     """Get the first- and second-order contributions to the right-hand
     transformed vector for orbital p for the hole part of the Green's
@@ -175,7 +267,6 @@ def get_e_hole(ccsd, orb):
     """
 
     nocc = ccsd.nocc
-    nvir = ccsd.nmo - nocc
 
     if orb < nocc:
         e1 = (
@@ -270,7 +361,7 @@ class GFCCSD(lib.StreamObject):
             self.nmom = (nmom, nmom)
         else:
             self.nmom = nmom
-        self.weight_tol = 1e-5
+        self.weight_tol = 1e-14
         self.e = None
         self.c = None
         self.t1 = None
@@ -421,9 +512,9 @@ class GFCCSD(lib.StreamObject):
         the block tridiagonal matrix.
         """
 
-        m, b = dyson.block_lanczos_gf.block_lanczos(t, nmom)
-        h_tri = dyson.linalg.build_block_tridiagonal(m, b)
-        bi = dyson.block_lanczos_gf.sqrt_and_inv(t[0])[0]
+        m, b = block_lanczos(t, nmom)
+        h_tri = build_block_tridiagonal(m, b)
+        bi = mat_sqrt(t[0])
 
         e, u = np.linalg.eigh(h_tri)
         u = np.dot(bi.T.conj(), u[:self.nmo])
@@ -516,7 +607,7 @@ class GFCCSD(lib.StreamObject):
         return self
 
     update = update_from_chk = update_from_chk_
-    
+
     def ipccsd(self, nroots=5):
         """Print and return IPs.
         """
@@ -576,7 +667,7 @@ class GFCCSD(lib.StreamObject):
         if self.e is None:
             return None
         cpt = chempot.binsearch_chempot((self.e, self.c), self.nmo, self.nocc*2)[0]
-        return GreensFunction(e, c[:self.nmo], chempot=cpt)
+        return GreensFunction(self.e, self.c[:self.nmo], chempot=cpt)
 
 
 class GFADC(GFCCSD):
