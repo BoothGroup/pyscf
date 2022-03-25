@@ -39,7 +39,7 @@ def kernel(gfccsd, th=None, tp=None, eris=None):
     w, v = np.linalg.eigh(p)
     del p
 
-    mask = np.abs(w) > gfccsd.weight_tol
+    mask = np.abs(w) > 1e-14
     w, v = w[mask], v[:, mask]
     u = np.block([u, v * w[None]])
 
@@ -194,7 +194,7 @@ def block_lanczos(t, nmom):
         # Compute B_{i}
         b2 = np.zeros((nmo, nmo))
 
-        for j in range(1, i+2):
+        for j in range(i+2):
             for l in range(i+1):
                 b2 += np.linalg.multi_dot((c[i, l].T, s[j+l+1], c[i, j-1]))
 
@@ -206,7 +206,7 @@ def block_lanczos(t, nmom):
         binv, null = mat_isqrt(b2, check_null_space=True)
 
         # Compute C_{i,n}
-        for j in range(1, i+2):
+        for j in range(i+2):
             tmp = (
                 + c[i, j-1]
                 - np.dot(c[i, j], m[i])
@@ -383,22 +383,26 @@ class GFCCSD(lib.StreamObject):
 
     def _finalize(self):
         cpt = chempot.binsearch_chempot((self.e, self.c), self.nmo, self.nocc*2)[0]
-        ips = self.e < cpt
-        eas = self.e >= cpt
+
+        mask = np.linalg.norm(self.c[:self.nmo], axis=0)**2 > 0.01
+        e, c = self.e[mask], self.c[:, mask]
+
+        ips = e < cpt
+        eas = e >= cpt
 
         logger.note(self, "Ionisation potentials:")
         logger.note(self, "  %4s %12s %12s" % ("root", "energy", "qpwt"))
         for nroot in range(min(5, np.sum(ips))):
-            e = -self.e[ips][-(nroot+1)]
-            qpwt = np.linalg.norm(self.c[:self.nmo][:, ips][:, -(nroot+1)])**2
-            logger.note(self, "  %4d %12.6f %12.6g" % (nroot, e, qpwt))
+            e_ip = -e[ips][-(nroot+1)]
+            qpwt = np.linalg.norm(c[:self.nmo][:, ips][:, -(nroot+1)])**2
+            logger.note(self, "  %4d %12.6f %12.6g" % (nroot, e_ip, qpwt))
 
         logger.note(self, "Electron affinity:")
         logger.note(self, "  %4s %12s %12s" % ("root", "energy", "qpwt"))
         for nroot in range(min(5, np.sum(eas))):
-            e = self.e[eas][nroot]
-            qpwt = np.linalg.norm(self.c[:self.nmo][:, eas][:, nroot])**2
-            logger.note(self, "%4d %12.6f %12.6g" % (nroot, e, qpwt))
+            e_ea = e[eas][nroot]
+            qpwt = np.linalg.norm(c[:self.nmo][:, eas][:, nroot])**2
+            logger.note(self, "%4d %12.6f %12.6g" % (nroot, e_ea, qpwt))
 
         return self
 
@@ -505,6 +509,91 @@ class GFCCSD(lib.StreamObject):
         logger.timer(self, "EA-EOM-CCSD moments", *cput0)
 
         return moms
+
+    ##TODO: freeze p, q if frozen in self._cc
+    #def get_ip_moments(self, imds=None, nmom=None):
+    #    """Get the moments of the IP-EOM-CCSD Green's function.
+    #    """
+
+    #    cput0 = (logger.process_clock(), logger.perf_counter())
+
+    #    eom = self.eomip_method()
+    #    if imds is None:
+    #        imds = self.make_imds(ea=False)
+    #    diag = eom.get_diag(imds)
+    #    matvec = lambda v: eom.matvec(v, imds, diag)
+
+    #    if nmom is None:
+    #        nmom = 2 * self.nmom[0] + 2
+    #    moms = np.zeros((nmom, self.nmo, self.nmo))
+
+    #    bras = [None] * self.nmo
+    #    for p in range(self.nmo):
+    #        r1, r2 = self.get_e_hole(p)
+    #        bras[p] = eom.amplitudes_to_vector(r1, r2)
+
+    #    for p in mpi_helper.nrange(self.nmo):
+    #        r1, r2 = self.get_b_hole(p)
+    #        ket = eom.amplitudes_to_vector(r1, r2)
+
+    #        for n in range(nmom):
+    #            for q in range(self.nmo):
+    #                bra = bras[q]
+    #                moms[n, p, q] += np.dot(bra, ket)
+
+    #            if (n+1) != nmom:
+    #                ket = matvec(ket)
+
+    #    mpi_helper.barrier()
+    #    moms = mpi_helper.allreduce(moms)
+
+    #    moms = 0.5 * (moms + moms.swapaxes(1, 2))
+
+    #    logger.timer(self, "IP-EOM-CCSD moments", *cput0)
+
+    #    return moms
+
+    #def get_ea_moments(self, imds=None, nmom=None):
+    #    """Get the moments of the EA-EOM-CCSD Green's function.
+    #    """
+
+    #    cput0 = (logger.process_clock(), logger.perf_counter())
+
+    #    eom = self.eomea_method()
+    #    if imds is None:
+    #        imds = self.make_imds(ip=False)
+    #    diag = eom.get_diag(imds)
+    #    matvec = lambda v: eom.matvec(v, imds, diag)
+
+    #    if nmom is None:
+    #        nmom = 2 * self.nmom[1] + 2
+    #    moms = np.zeros((nmom, self.nmo, self.nmo))
+
+    #    bras = [None] * self.nmo
+    #    for p in range(self.nmo):
+    #        r1, r2 = self.get_e_part(p)
+    #        bras[p] = eom.amplitudes_to_vector(r1, r2)
+
+    #    for p in mpi_helper.nrange(self.nmo):
+    #        r1, r2 = self.get_b_part(p)
+    #        ket = eom.amplitudes_to_vector(r1, r2)
+
+    #        for n in range(nmom):
+    #            for q in range(self.nmo):
+    #                bra = bras[q]
+    #                moms[n, p, q] += np.dot(bra, ket)
+
+    #            if (n+1) != nmom:
+    #                ket = matvec(ket)
+
+    #    mpi_helper.barrier()
+    #    moms = mpi_helper.allreduce(moms)
+
+    #    moms = 0.5 * (moms + moms.swapaxes(1, 2))
+
+    #    logger.timer(self, "EA-EOM-CCSD moments", *cput0)
+
+    #    return moms
 
     def eigh_moments(self, t, nmom):
         """Block tridiagonalise the matrix under the constraint of
