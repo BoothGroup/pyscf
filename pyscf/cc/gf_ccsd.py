@@ -56,11 +56,14 @@ def kernel(gfccsd, th=None, tp=None, eris=None):
 
 def _kernel_dynamic(gfccsd, grid, eta=1e-2, eris=None, conv_tol=1e-6, max_cycle=100):
     """Run a more traditional GF-CCSD calculation for a series of
-    frequencies using vector correction and DIIS.
+    frequencies using vector correction.
     """
+
+    from scipy.sparse.linalg import LinearOperator, gcrotmk
 
     ccsd = gfccsd._cc
     grid = np.array(grid)
+    calls = defaultdict(int)
 
     def _part(diag, matvec, get_b, get_e):
         gf = np.zeros((grid.size, ccsd.nmo, ccsd.nmo), dtype=np.complex128)
@@ -71,7 +74,9 @@ def _kernel_dynamic(gfccsd, grid, eta=1e-2, eris=None, conv_tol=1e-6, max_cycle=
                 out = np.zeros((diag.size,), dtype=np.complex128)
             out = (freq - 1.0j * eta) * vec
             out -= matvec(vec)
+            matvec_dynamic.count += 1
             return out
+        matvec_dynamic.count = 0
 
         def matdiv_dynamic(freq, vec, out=None):
             # Apprioximate vec / (freq - H - i\eta) using the diagonal
@@ -87,42 +92,25 @@ def _kernel_dynamic(gfccsd, grid, eta=1e-2, eris=None, conv_tol=1e-6, max_cycle=
         for p in range(ccsd.nmo):
             b = eom.amplitudes_to_vector(*get_b(ccsd, p))
 
-            for w, freq in enumerate(grid):
-                diis = lib.diis.DIIS()
-                omega = freq - 1.0j * eta
-                converged = False
-                r = Hx = None
-
-                # Guess X using the inverse of H, approximated via the diagonal
-                x = b / (omega - diag)
-
-                for i in range(1, max_cycle+1):
-                    # Compute product of current X with H
-                    Hx = omega * x - matvec(x)
-
-                    # Find error and compute residual
-                    e = b - Hx
-                    residual = np.linalg.norm(e)
-
-                    # Compute correction vector using the inverse diagonal
-                    r = matdiv_dynamic(freq, e, out=r)
-
-                    # Check if convergence criteria are met
-                    if residual < conv_tol:
-                        converged = True
-                        break
-
-                    # Update X using correction vector and solve linear system
-                    x += r
-                    x = diis.update(x, xerr=r)
+            for w in mpi_helper.nrange(grid.size):
+                freq = grid[w]
+                shape = (diag.size, diag.size)
+                ax = LinearOperator(shape, lambda x: matvec_dynamic(freq, x))
+                x0 = matdiv_dynamic(freq, b)
+                x, info = gcrotmk(ax, b, x0=x0, atol=0, tol=conv_tol)
 
                 for q, e in enumerate(es):
-                    if converged:
+                    if info == 0:
                         gf[w, q, p] += np.dot(e, x)
                     else:
                         gf[w, q, p] = np.nan
 
+        mpi_helper.barrier()
+        gf = mpi_helper.allreduce(gf)
+
         gf = 0.5 * (gf + gf.swapaxes(1, 2)).conj()
+
+        calls[matvec] = mpi_helper.allreduce(matvec_dynamic.count)
 
         return gf
 
@@ -139,6 +127,9 @@ def _kernel_dynamic(gfccsd, grid, eta=1e-2, eris=None, conv_tol=1e-6, max_cycle=
     gf_vir = _part(diag, matvec, get_b_part, get_e_part)
 
     gf = gf_occ + gf_vir
+
+    for key, val in calls.items():
+        logger.debug(gfccsd, "%d calls to %s", val, key)
 
     return gf
 
@@ -436,7 +427,11 @@ class GFCCSD(lib.StreamObject):
         if imds is None:
             imds = self.make_imds(ea=False)
         diag = eom.get_diag(imds)
-        matvec = lambda v: eom.l_matvec(v, imds, diag)
+
+        def matvec(v):
+            matvec.count += 1
+            return eom.l_matvec(v, imds, diag)
+        matvec.count = 0
 
         if nmom is None:
             nmom = 2 * self.nmom[0] + 2
@@ -465,6 +460,7 @@ class GFCCSD(lib.StreamObject):
         moms = 0.5 * (moms + moms.swapaxes(1, 2))
 
         logger.timer(self, "IP-EOM-CCSD moments", *cput0)
+        logger.debug(self, "%d calls to %s", mpi_helper.allreduce(matvec.count), matvec)
 
         return moms
 
@@ -478,7 +474,11 @@ class GFCCSD(lib.StreamObject):
         if imds is None:
             imds = self.make_imds(ip=False)
         diag = eom.get_diag(imds)
-        matvec = lambda v: eom.l_matvec(v, imds, diag)
+
+        def matvec(v):
+            matvec.count += 1
+            return eom.l_matvec(v, imds, diag)
+        matvec.count = 0
 
         if nmom is None:
             nmom = 2 * self.nmom[1] + 2
@@ -507,6 +507,7 @@ class GFCCSD(lib.StreamObject):
         moms = 0.5 * (moms + moms.swapaxes(1, 2))
 
         logger.timer(self, "EA-EOM-CCSD moments", *cput0)
+        logger.debug(self, "%d calls to %s", mpi_helper.allreduce(matvec.count), matvec)
 
         return moms
 
