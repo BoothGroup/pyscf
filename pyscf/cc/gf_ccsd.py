@@ -21,34 +21,42 @@ def kernel(gfccsd, th=None, tp=None, eris=None):
 
     if th is None:
         th = gfccsd.get_ip_moments(imds=imds)
-    eh, uh = gfccsd.eigh_moments(th, gfccsd.nmom[0])
+    e_ip, uh, bh = gfccsd.eigh_moments(th, gfccsd.nmom[0])
+    v_left_ip = np.dot(bh, uh[:gfccsd.nmo])
+    v_right_ip = np.dot(np.linalg.inv(uh)[:, :gfccsd.nmo], bh).T.conj()
+
+    for n in range(2*gfccsd.nmom[0]+2):
+        t1 = np.einsum("xk,yk,k->xy", v_left_ip, v_right_ip.conj(), e_ip**n)
+        t1_scaled = t1 / np.max(np.abs(t1))
+        t0_scaled = th[n] / np.max(np.abs(th[n]))
+        err = np.max(np.abs(t0_scaled - t1_scaled))
+        (logger.note if err < 1e-8 else logger.warn)(
+                gfccsd, "Scaled error in hole moment %d: %10.6g", n, err)
+
+    # We have actually solved for occupied quasiparticle states, flip sign:
+    e_ip *= -1
 
     if tp is None:
         tp = gfccsd.get_ea_moments(imds=imds)
-    ep, up = gfccsd.eigh_moments(tp, gfccsd.nmom[1])
+    e_ea, up, bp = gfccsd.eigh_moments(tp, gfccsd.nmom[1])
+    v_left_ea = np.dot(bp, up[:gfccsd.nmo])
+    v_right_ea = np.dot(np.linalg.inv(up)[:, :gfccsd.nmo], bp).T.conj()
 
-    e = np.concatenate([eh, ep])
-    u = np.concatenate([uh, up], axis=1).T.conj()
+    for n in range(2*gfccsd.nmom[0]+2):
+        t1 = np.einsum("xk,yk,k->xy", v_left_ea, v_right_ea.conj(), e_ea**n)
+        t1_scaled = t1 / np.max(np.abs(t1))
+        t0_scaled = tp[n] / np.max(np.abs(tp[n]))
+        err = np.max(np.abs(t0_scaled - t1_scaled))
+        (logger.note if err < 1e-8 else logger.warn)(
+                gfccsd, "Scaled error in particle moment %d: %10.6g", n, err)
 
-    norm = np.linalg.norm(u, axis=0, keepdims=True)
-    norm[np.abs(norm) < 1e-14] = 1e-14
-    u /= norm
+    # Eigenvalues are complex, sort them by their real part:
+    mask = np.argsort(e_ip.real)
+    e_ip, v_left_ip, v_right_ip = e_ip[mask], v_left_ip[:, mask], v_right_ip[:, mask]
+    mask = np.argsort(e_ea.real)
+    e_ea, v_left_ea, v_right_ea = e_ea[mask], v_left_ea[:, mask], v_right_ea[:, mask]
 
-    p = np.eye(e.size) - np.dot(u, u.T.conj())
-    w, v = np.linalg.eigh(p)
-
-    mask = np.abs(w) > 1e-14
-    w, v = w[mask], v[:, mask]
-    u = np.block([u, v * w[None]])
-
-    hbar = np.dot(u.T.conj() * e[None], u)
-    e, c = np.linalg.eigh(hbar)
-
-    # Remove low poles with unphysical energies FIXME
-    mask = np.linalg.norm(c[:gfccsd.nmo], axis=0)**2 > gfccsd.weight_tol
-    e, c = e[mask], c[:, mask]
-
-    return e, c
+    return e_ip, (v_left_ip, v_right_ip), e_ea, (v_left_ea, v_right_ea)
 
 
 def _kernel_dynamic(gfccsd, grid, eta=1e-2, eris=None, conv_tol=1e-8):
@@ -136,91 +144,105 @@ def mat_sqrt(m):
     """Square root a matrix.
     """
 
-    w, v = np.linalg.eigh(m)
+    w, v = np.linalg.eig(m)
 
-    mask = w >= 0.0
-    w, v = w[mask], v[:, mask]
-
-    return np.dot(v * w[None]**0.5, v.T)
+    return np.dot(v * w[None]**(0.5+0j), np.linalg.inv(v))
 
 
 def mat_isqrt(m, check_null_space=False, tol=1e-14):
     """Inverse square root of the non-null-space of a matrix.
     """
 
-    w, v = np.linalg.eigh(m)
+    w, v = np.linalg.eig(m)
+    vinv = np.linalg.inv(v)
 
-    null_space = np.any(w < tol)
-    mask = w >= tol
+    mask = w != 0
     w, v = w[mask], v[:, mask]
+    vinv = vinv[mask]
 
-    if check_null_space:
-        return np.dot(v * w[None]**-0.5, v.T), null_space
-    else:
-        return np.dot(v * w[None]**-0.5, v.T)
+    return np.dot(v * w[None]**-(0.5+0j), vinv)
 
 
 def block_lanczos(t, nmom):
-    """Compute the on- and off-diagonal blocks from the moments.
+    """Compute the on- and off-diagonal blocks from the non-Hermitian moments.
     """
 
     nmo = t[0].shape[-1]
+    dtype = np.complex128
 
-    m = np.zeros((nmom+1, nmo, nmo))
-    b = np.zeros((nmom, nmo, nmo))
-    s = np.zeros_like(t)
-    c = defaultdict(lambda: np.zeros((nmo, nmo)))
-    c[0, 0] = np.eye(nmo)
+    a = np.zeros((nmom+1, nmo, nmo), dtype=dtype)
+    b = np.zeros((nmom, nmo, nmo), dtype=dtype)
+    c = np.zeros((nmom, nmo, nmo), dtype=dtype)
+    s = np.zeros((2*nmom+2, nmo, nmo), dtype=dtype)
+    v = defaultdict(lambda: np.zeros((nmo, nmo), dtype=dtype))
+    w = defaultdict(lambda: np.zeros((nmo, nmo), dtype=dtype))
+    v[0, 0] = np.eye(nmo).astype(dtype)
+    w[0, 0] = np.eye(nmo).astype(dtype)
 
     bi = mat_isqrt(t[0])
 
     for i in range(len(t)):
         s[i] = np.linalg.multi_dot((bi, t[i], bi))
 
-    m[0] = s[1]
+    a[0] = s[1]
 
     for i in range(nmom):
-        # Compute B_{i}
-        b2 = np.zeros((nmo, nmo))
+        # Compute B_{i} and C_{i}
+        b2 = np.zeros((nmo, nmo), dtype=dtype)
+        c2 = np.zeros((nmo, nmo), dtype=dtype)
 
         for j in range(i+2):
             for l in range(i+1):
-                b2 += np.linalg.multi_dot((c[i, l].T, s[j+l+1], c[i, j-1]))
+                b2 += np.linalg.multi_dot((w[i, l], s[j+l+1], v[i, j-1]))
+                c2 += np.linalg.multi_dot((w[i, j-1], s[j+l+1], v[i, l]))
 
-        b2 -= np.dot(m[i], m[i])
+        b2 -= np.dot(a[i], a[i])
+        c2 -= np.dot(a[i], a[i])
         if i:
-            b2 -= np.dot(b[i-1], b[i-1]).T
+            b2 -= np.dot(c[i-1], c[i-1])
+            c2 -= np.dot(b[i-1], b[i-1])
 
         b[i] = mat_sqrt(b2)
-        binv, null = mat_isqrt(b2, check_null_space=True)
+        c[i] = mat_sqrt(c2)
+        binv = mat_isqrt(b2)
+        cinv = mat_isqrt(c2)
 
-        # Compute C_{i,n}
+        # Compute V_{i,n}
         for j in range(i+2):
             tmp = (
-                + c[i, j-1]
-                - np.dot(c[i, j], m[i])
-                - np.dot(c[i-1, j], b[i-1].T)
+                + v[i, j-1]
+                - np.dot(v[i, j], a[i])
+                - np.dot(v[i-1, j], b[i-1])
             )
-            c[i+1, j] = np.dot(tmp, binv)
+            v[i+1, j] = np.dot(tmp, cinv)
+            tmp = (
+                + w[i, j-1]
+                - np.dot(a[i], w[i, j])
+                - np.dot(c[i-1], w[i-1, j])
+            )
+            w[i+1, j] = np.dot(binv, tmp)
 
         for j in range(i+2):
             for l in range(i+2):
-                m[i+1] += np.linalg.multi_dot((c[i+1, l].T, s[j+l+1], c[i+1, j]))
+                a[i+1] += np.linalg.multi_dot((w[i+1, l], s[j+l+1], v[i+1, j]))
 
-    return m, b
+    return a, b, c
 
 
-def build_block_tridiagonal(m, b):
+def build_block_tridiagonal(m, b, c=None):
     """Construct a block tridiagonal matrix from a list of on-diagonal
     and off-diagonal blocks.
     """
 
-    z = np.zeros_like(m[0])
+    z = np.zeros_like(m[0], dtype=m[0].dtype)
+
+    if c is None:
+        c = [x.T.conj() for x in b]
 
     h = np.block([[
-        m[i]   if i == j   else
-        b[j]   if j == i-1 else
-        b[i].T if i == j-1 else z
+        m[i] if i == j   else
+        b[j] if j == i-1 else
+        c[i] if i == j-1 else z
         for j in range(len(m))]
         for i in range(len(m))]
     )
@@ -350,9 +372,11 @@ class GFCCSD(lib.StreamObject):
             self.nmom = (nmom, nmom)
         else:
             self.nmom = nmom
-        self.weight_tol = 1e-14
-        self.e = None
-        self.c = None
+        self.weight_tol = 1e-1
+        self.e_ip = None
+        self.v_ip = None
+        self.e_ea = None
+        self.v_ea = None
         self.t1 = None
         self.t2 = None
         self.l1 = None
@@ -371,27 +395,27 @@ class GFCCSD(lib.StreamObject):
         log.info("chkfile = %s", self.chkfile)
 
     def _finalize(self):
-        cpt = chempot.binsearch_chempot((self.e, self.c), self.nmo, self.nocc*2)[0]
+        v_ip_l, v_ip_r = self.v_ip
+        mask = np.abs(np.sum(v_ip_l * v_ip_r.conj(), axis=0)) > self.weight_tol
+        e_ip = self.e_ip[mask].real
+        v_ip_l, v_ip_r = v_ip_l[:, mask], v_ip_r[:, mask]
 
-        mask = np.linalg.norm(self.c[:self.nmo], axis=0)**2 > 0.01
-        e, c = self.e[mask], self.c[:, mask]
-
-        ips = e < cpt
-        eas = e >= cpt
+        v_ea_l, v_ea_r = self.v_ea
+        mask = np.abs(np.sum(v_ea_l * v_ea_r.conj(), axis=0)) > self.weight_tol
+        e_ea = self.e_ea[mask].real
+        v_ea_l, v_ea_r = v_ea_l[:, mask], v_ea_r[:, mask]
 
         logger.note(self, "Ionisation potentials:")
         logger.note(self, "  %4s %12s %12s" % ("root", "energy", "qpwt"))
-        for nroot in range(min(5, np.sum(ips))):
-            e_ip = -e[ips][-(nroot+1)]
-            qpwt = np.linalg.norm(c[:self.nmo][:, ips][:, -(nroot+1)])**2
-            logger.note(self, "  %4d %12.6f %12.6g" % (nroot, e_ip, qpwt))
+        for nroot in range(min(5, len(e_ip))):
+            qpwt = np.abs(np.sum(v_ip_l[:, nroot] * v_ip_r[:, nroot].conj())).real
+            logger.note(self, "  %4d %12.6f %12.6g" % (nroot, e_ip[nroot], qpwt))
 
         logger.note(self, "Electron affinity:")
         logger.note(self, "  %4s %12s %12s" % ("root", "energy", "qpwt"))
-        for nroot in range(min(5, np.sum(eas))):
-            e_ea = e[eas][nroot]
-            qpwt = np.linalg.norm(c[:self.nmo][:, eas][:, nroot])**2
-            logger.note(self, "%4d %12.6f %12.6g" % (nroot, e_ea, qpwt))
+        for nroot in range(min(5, len(e_ea))):
+            qpwt = np.abs(np.sum(v_ea_l[:, nroot] * v_ea_r[:, nroot].conj())).real
+            logger.note(self, "  %4d %12.6f %12.6g" % (nroot, e_ea[nroot], qpwt))
 
         return self
 
@@ -447,15 +471,13 @@ class GFCCSD(lib.StreamObject):
             for n in range(nmom):
                 for q in range(self.nmo):
                     bra = bras[q]
-                    moms[n, p, q] += np.dot(bra, ket)
+                    moms[n, q, p] += np.dot(bra, ket)
 
                 if (n+1) != nmom:
                     ket = matvec(ket)
 
         mpi_helper.barrier()
         moms = mpi_helper.allreduce(moms)
-
-        moms = 0.5 * (moms + moms.swapaxes(-1, -2))
 
         logger.timer(self, "IP-EOM-CCSD moments", *cput0)
         logger.debug(self, "%d calls to %s", mpi_helper.allreduce(matvec.count), matvec)
@@ -494,15 +516,13 @@ class GFCCSD(lib.StreamObject):
             for n in range(nmom):
                 for q in range(self.nmo):
                     bra = bras[q]
-                    moms[n, p, q] += np.dot(bra, ket)
+                    moms[n, q, p] += np.dot(bra, ket)
 
                 if (n+1) != nmom:
                     ket = matvec(ket)
 
         mpi_helper.barrier()
         moms = mpi_helper.allreduce(moms)
-
-        moms = 0.5 * (moms + moms.swapaxes(-1, -2))
 
         logger.timer(self, "EA-EOM-CCSD moments", *cput0)
         logger.debug(self, "%d calls to %s", mpi_helper.allreduce(matvec.count), matvec)
@@ -515,14 +535,12 @@ class GFCCSD(lib.StreamObject):
         the block tridiagonal matrix.
         """
 
-        m, b = block_lanczos(t, nmom)
-        h_tri = build_block_tridiagonal(m, b)
-        bi = mat_sqrt(t[0]) / np.sqrt(2.0)
+        a, b, c = block_lanczos(t, nmom)
+        h_tri = build_block_tridiagonal(a, b, c)
+        e, u = np.linalg.eig(h_tri)
+        bi = mat_sqrt(t[0])
 
-        e, u = np.linalg.eigh(h_tri)
-        u = np.dot(bi, u[:self.nmo])
-
-        return e, u
+        return e, u, bi
 
     def make_imds(self, eris=None, ip=True, ea=True):
         """Build EOM intermediates.
@@ -546,7 +564,8 @@ class GFCCSD(lib.StreamObject):
         if imds is None:
             imds = self.make_imds(eris=eris, ea=False)
 
-        dm1 = self.get_ip_moments(imds=imds, nmom=0)[0] * 2.0
+        dm1 = self.get_ip_moments(imds=imds, nmom=0)[0]
+        dm1 = dm1 + dm1.T.conj()
 
         if ao_repr:
             mo = self._cc.mo_coeff
@@ -584,28 +603,40 @@ class GFCCSD(lib.StreamObject):
                     % (self._cc.__class__.__name__, self.__class__.__name__)
             )
 
-        e, c = self.e, self.c = kernel(self, th=th, tp=tp, eris=eris)
+        self.e_ip, self.v_ip, self.e_ea, self.v_ea = kernel(self, th=th, tp=tp, eris=eris)
 
         if self.chkfile is not None:
             self.dump_chk()
 
         self._finalize()
 
-        return self.e, self.c
+        return self.e_ip, self.v_ip, self.e_ea, self.v_ea
 
     def dump_chk(self, chkfile=None, key="gfccsd"):
         if chkfile is None:
             chkfile = self.chkfile
-        lib.chkfile.dump(chkfile, "%s/e" % key, self.e)
-        lib.chkfile.dump(chkfile, "%s/c" % key, self.c)
+        lib.chkfile.dump(chkfile, "%s/e_ip" % key, self.e_ip)
+        lib.chkfile.dump(chkfile, "%s/v_ip_left" % key, self.v_ip[0])
+        lib.chkfile.dump(chkfile, "%s/v_ip_right" % key, self.v_ip[1])
+        lib.chkfile.dump(chkfile, "%s/e_ea" % key, self.e_ea)
+        lib.chkfile.dump(chkfile, "%s/v_ea_left" % key, self.v_ea[0])
+        lib.chkfile.dump(chkfile, "%s/v_ea_right" % key, self.v_ea[1])
         lib.chkfile.dump(chkfile, "%s/nmom" % key, np.array(self.nmom))
         return self
 
     def update_from_chk_(self, chkfile=None, key="gfccsd"):
         if chkfile is None:
             chkfile = self.chkfile
-        self.e = lib.chkfile.load(chkfile, "%s/e" % key)
-        self.c = lib.chkfile.load(chkfile, "%s/c" % key)
+        self.e_ip = lib.chkfile.load(chkfile, "%s/e_ip" % key)
+        self.v_ip = (
+                lib.chkfile.load(chkfile, "%s/v_ip_left" % key),
+                lib.chkfile.load(chkfile, "%s/v_ip_right" % key),
+        )
+        self.e_ea = lib.chkfile.load(chkfile, "%s/e_ea" % key)
+        self.v_ea = (
+                lib.chkfile.load(chkfile, "%s/v_ea_left" % key),
+                lib.chkfile.load(chkfile, "%s/v_ea_right" % key),
+        )
         self.nmom = tuple(lib.chkfile.load(chkfile, "%s/nmom" % key))
         return self
 
@@ -615,43 +646,57 @@ class GFCCSD(lib.StreamObject):
         """Print and return IPs.
         """
 
-        cpt = chempot.binsearch_chempot((self.e, self.c), self.nmo, self.nocc*2)[0]
-        ips = self.e < cpt
+        e_ip = self.e_ip
+        v_ip_l, v_ip_r = self.v_ip
+        mask = np.abs(np.sum(v_ip_l * v_ip_r.conj(), axis=0)) > self.weight_tol
 
-        e = list(-self.e[ips][::-1][:nroots])
-        c = list(self.c[:, ips][:, ::-1][:, :nroots].T)
+        e_ip = self.e_ip[mask]
+        v_ip_l, v_ip_r = v_ip_l[:, mask], v_ip_r[:, mask]
 
-        nroots = max(nroots, len(e))
+        nroots = max(nroots, len(e_ip))
 
-        for n, en, cn in zip(range(nroots), e, c):
-            qpwt = np.linalg.norm(cn[:self.nmo])**2
-            logger.note(self, "  %2s %2d %16.10g %0.6g" % ("IP", n, en, qpwt))
+        e_ip = e_ip[:nroots]
+        v_ip_l = list(v_ip_l[:, :nroots].T)
+        v_ip_r = list(v_ip_r[:, :nroots].T)
+
+        logger.note(self, "  %2s %2s %16s %10s" % ("", "", "Energy", "Weight"))
+        for n, en, vnl, vnr in zip(range(nroots), e_ip, v_ip_l, v_ip_r):
+            qpwt = np.abs(np.sum(vnl * vnr.conj())).real
+            warn = "(Warning: complex excitation)" if np.abs(en.imag) > 1e-8 else ""
+            logger.note(self, "  %2s %2d %16.10g %10.6g %s" % ("IP", n, en.real, qpwt, warn))
 
         if nroots == 1:
-            return e[0], c[0]
+            return e_ip[0].real, v_ip_l[0], v_ip_r[0]
         else:
-            return e, c
+            return e_ip.real, v_ip_l, v_ip_r
 
     def eaccsd(self, nroots=5):
         """Print and return EAs.
         """
 
-        cpt = chempot.binsearch_chempot((self.e, self.c), self.nmo, self.nocc*2)[0]
-        eas = self.e >= cpt
+        e_ea = self.e_ea
+        v_ea_l, v_ea_r = self.v_ea
+        mask = np.abs(np.sum(v_ea_l * v_ea_r.conj(), axis=0)) > self.weight_tol
 
-        e = list(self.e[eas][:nroots])
-        c = list(self.c[:, eas][:, :nroots].T)
+        e_ea = e_ea[mask]
+        v_ea_l, v_ea_r = v_ea_l[:, mask], v_ea_r[:, mask]
 
-        nroots = max(nroots, len(e))
+        nroots = max(nroots, len(e_ea))
 
-        for n, en, cn in zip(range(nroots), e, c):
-            qpwt = np.linalg.norm(cn[:self.nmo])**2
-            logger.note(self, "  %2s %2d %16.10g %0.6g" % ("EA", n, en, qpwt))
+        e_ea = e_ea[:nroots]
+        v_ea_l = list(v_ea_l[:, :nroots].T)
+        v_ea_r = list(v_ea_r[:, :nroots].T)
+
+        logger.note(self, "  %2s %2s %16s %10s" % ("", "", "Energy", "Weight"))
+        for n, en, vnl, vnr in zip(range(nroots), e_ea, v_ea_l, v_ea_r):
+            qpwt = np.abs(np.sum(vnl * vnr.conj())).real
+            warn = "(Warning: complex excitation)" if np.abs(en.imag) > 1e-8 else ""
+            logger.note(self, "  %2s %2d %16.10g %10.6g %s" % ("EA", n, en.real, qpwt, warn))
 
         if nroots == 1:
-            return e[0], c[0]
+            return e_ea[0].real, v_ea_l[0], v_ea_r[0]
         else:
-            return e, c
+            return e_ea.real, v_ea_l, v_ea_r
 
     @property
     def nmo(self):
@@ -664,85 +709,6 @@ class GFCCSD(lib.StreamObject):
     @property
     def nvir(self):
         return self.nmo - self.nocc
-
-    @property
-    def gf(self):
-        if self.e is None:
-            return None
-        cpt = chempot.binsearch_chempot((self.e, self.c), self.nmo, self.nocc*2)[0]
-        return GreensFunction(self.e, self.c[:self.nmo], chempot=cpt)
-
-
-class GFADC(GFCCSD):
-    """Green's function solver for algebraic diagrammatic construction.
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.t1 = self._adc.t1[0]
-        self.t2 = self._adc.t2[0]
-
-    @property
-    def _adc(self):
-        return self._cc
-
-    def eomip_method(self):
-        from pyscf.adc.radc import RADCIP
-        eom = RADCIP(self._adc)
-        eris = eom.transform_integrals()
-        M = eom.get_imds(eris=eris)
-        fake = lambda: None
-        fake.t1, fake.t2 = self._adc.t1[0], self._adc.t2[0]
-        fake.get_diag = lambda imds: eom.get_diag(M)
-        fake.matvec = lambda v, *args: (eom.matvec(M, eris))(v)
-        fake.amplitudes_to_vector = lambda r1, r2: np.concatenate([r1.ravel(), r2.ravel()], axis=0)
-        return fake
-
-    def eomea_method(self):
-        from pyscf.adc.radc import RADCEA
-        eom = RADCEA(self._adc)
-        eris = eom.transform_integrals()
-        M = eom.get_imds(eris=eris)
-        fake = lambda: None
-        fake.t1, fake.t2 = self._adc.t1[0], self._adc.t2[0]
-        fake.get_diag = lambda imds: eom.get_diag(M)
-        fake.matvec = lambda v, *args: (eom.matvec(M, eris))(v)
-        fake.amplitudes_to_vector = lambda r1, r2: np.concatenate([r1.ravel(), r2.ravel()], axis=0)
-        return fake
-
-    def make_imds(self, eris=None, ip=True, ea=True):
-        return None
-
-    def kernel(self, t1=None, t2=None, l1=None, l2=None, eris=None):
-        if self.verbose >= logger.WARN:
-            self.check_sanity()
-        self.dump_flags()
-
-        e, c = self.e, self.c = kernel(self, eris=eris)
-
-        if self.chkfile is not None:
-            self.dump_chk()
-
-        self._finalize()
-
-        return self.e, self.c
-
-    ip_adc = ipadc = GFCCSD.ipccsd
-    ea_adc = eaadc = GFCCSD.eaccsd
-
-    get_b_hole = get_b_hole
-    get_b_part = get_b_part
-    get_e_hole = get_b_hole
-    get_e_part = get_b_part
-
-    @property
-    def nmo(self):
-        return self._adc._nmo
-
-    @property
-    def nocc(self):
-        return self._adc._nocc
-
 
 
 if __name__ == "__main__":
@@ -757,15 +723,13 @@ if __name__ == "__main__":
     gfcc.kernel()
 
     ip1, vip1 = ccsd.ipccsd(nroots=8)
-    ip2, vip2 = gfcc.ipccsd(nroots=8)
+    ip2, vip2, uip2 = gfcc.ipccsd(nroots=8)
 
     ea1, vea1 = ccsd.eaccsd(nroots=8)
-    ea2, vea2 = gfcc.eaccsd(nroots=8)
+    ea2, vea2, uea2 = gfcc.eaccsd(nroots=8)
 
     print(np.abs(ip1[0]-ip2[0]))
     print(np.abs(ip1[1]-ip2[1]))
-    print(np.abs(ip1[2]-ip2[2]))
     print(np.abs(ea1[0]-ea2[0]))
     print(np.abs(ea1[1]-ea2[1]))
-    print(np.abs(ea1[2]-ea2[2]))
 
