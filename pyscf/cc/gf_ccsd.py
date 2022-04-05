@@ -22,7 +22,6 @@ def kernel(gfccsd, th=None, tp=None, eris=None):
     if th is None:
         th = gfccsd.get_ip_moments(imds=imds)
     eh, uh = gfccsd.eigh_moments(th, gfccsd.nmom[0])
-    eh *= -1
 
     if tp is None:
         tp = gfccsd.get_ea_moments(imds=imds)
@@ -37,15 +36,13 @@ def kernel(gfccsd, th=None, tp=None, eris=None):
 
     p = np.eye(e.size) - np.dot(u, u.T.conj())
     w, v = np.linalg.eigh(p)
-    del p
 
     mask = np.abs(w) > 1e-14
     w, v = w[mask], v[:, mask]
     u = np.block([u, v * w[None]])
 
-    h = np.dot(u.T.conj() * e[None], u)
-    e, c = np.linalg.eigh(h)
-    del h
+    hbar = np.dot(u.T.conj() * e[None], u)
+    e, c = np.linalg.eigh(hbar)
 
     # Remove low poles with unphysical energies FIXME
     mask = np.linalg.norm(c[:gfccsd.nmo], axis=0)**2 > gfccsd.weight_tol
@@ -54,7 +51,7 @@ def kernel(gfccsd, th=None, tp=None, eris=None):
     return e, c
 
 
-def _kernel_dynamic(gfccsd, grid, eta=1e-2, eris=None, conv_tol=1e-6, max_cycle=100):
+def _kernel_dynamic(gfccsd, grid, eta=1e-2, eris=None, conv_tol=1e-8):
     """Run a more traditional GF-CCSD calculation for a series of
     frequencies using vector correction.
     """
@@ -96,8 +93,9 @@ def _kernel_dynamic(gfccsd, grid, eta=1e-2, eris=None, conv_tol=1e-6, max_cycle=
                 freq = grid[w]
                 shape = (diag.size, diag.size)
                 ax = LinearOperator(shape, lambda x: matvec_dynamic(freq, x))
+                mx = LinearOperator(shape, lambda x: matdiv_dynamic(freq, x))
                 x0 = matdiv_dynamic(freq, b)
-                x, info = gcrotmk(ax, b, x0=x0, atol=0, tol=conv_tol)
+                x, info = gcrotmk(ax, b, x0=x0, M=mx, atol=0, tol=conv_tol, m=30)
 
                 for q, e in enumerate(es):
                     if info == 0:
@@ -189,9 +187,9 @@ def block_lanczos(t, nmom):
             for l in range(i+1):
                 b2 += np.linalg.multi_dot((c[i, l].T, s[j+l+1], c[i, j-1]))
 
-        b2 -= np.dot(m[i], m[i].T)
+        b2 -= np.dot(m[i], m[i])
         if i:
-            b2 -= np.dot(b[i-1], b[i-1].T).T
+            b2 -= np.dot(b[i-1], b[i-1]).T
 
         b[i] = mat_sqrt(b2)
         binv, null = mat_isqrt(b2, check_null_space=True)
@@ -430,7 +428,7 @@ class GFCCSD(lib.StreamObject):
 
         def matvec(v):
             matvec.count += 1
-            return eom.l_matvec(v, imds, diag)
+            return -eom.l_matvec(v, imds, diag)
         matvec.count = 0
 
         if nmom is None:
@@ -457,7 +455,7 @@ class GFCCSD(lib.StreamObject):
         mpi_helper.barrier()
         moms = mpi_helper.allreduce(moms)
 
-        moms = 0.5 * (moms + moms.swapaxes(1, 2))
+        moms = 0.5 * (moms + moms.swapaxes(-1, -2))
 
         logger.timer(self, "IP-EOM-CCSD moments", *cput0)
         logger.debug(self, "%d calls to %s", mpi_helper.allreduce(matvec.count), matvec)
@@ -504,97 +502,12 @@ class GFCCSD(lib.StreamObject):
         mpi_helper.barrier()
         moms = mpi_helper.allreduce(moms)
 
-        moms = 0.5 * (moms + moms.swapaxes(1, 2))
+        moms = 0.5 * (moms + moms.swapaxes(-1, -2))
 
         logger.timer(self, "EA-EOM-CCSD moments", *cput0)
         logger.debug(self, "%d calls to %s", mpi_helper.allreduce(matvec.count), matvec)
 
         return moms
-
-    ##TODO: freeze p, q if frozen in self._cc
-    #def get_ip_moments(self, imds=None, nmom=None):
-    #    """Get the moments of the IP-EOM-CCSD Green's function.
-    #    """
-
-    #    cput0 = (logger.process_clock(), logger.perf_counter())
-
-    #    eom = self.eomip_method()
-    #    if imds is None:
-    #        imds = self.make_imds(ea=False)
-    #    diag = eom.get_diag(imds)
-    #    matvec = lambda v: eom.matvec(v, imds, diag)
-
-    #    if nmom is None:
-    #        nmom = 2 * self.nmom[0] + 2
-    #    moms = np.zeros((nmom, self.nmo, self.nmo))
-
-    #    bras = [None] * self.nmo
-    #    for p in range(self.nmo):
-    #        r1, r2 = self.get_e_hole(p)
-    #        bras[p] = eom.amplitudes_to_vector(r1, r2)
-
-    #    for p in mpi_helper.nrange(self.nmo):
-    #        r1, r2 = self.get_b_hole(p)
-    #        ket = eom.amplitudes_to_vector(r1, r2)
-
-    #        for n in range(nmom):
-    #            for q in range(self.nmo):
-    #                bra = bras[q]
-    #                moms[n, p, q] += np.dot(bra, ket)
-
-    #            if (n+1) != nmom:
-    #                ket = matvec(ket)
-
-    #    mpi_helper.barrier()
-    #    moms = mpi_helper.allreduce(moms)
-
-    #    moms = 0.5 * (moms + moms.swapaxes(1, 2))
-
-    #    logger.timer(self, "IP-EOM-CCSD moments", *cput0)
-
-    #    return moms
-
-    #def get_ea_moments(self, imds=None, nmom=None):
-    #    """Get the moments of the EA-EOM-CCSD Green's function.
-    #    """
-
-    #    cput0 = (logger.process_clock(), logger.perf_counter())
-
-    #    eom = self.eomea_method()
-    #    if imds is None:
-    #        imds = self.make_imds(ip=False)
-    #    diag = eom.get_diag(imds)
-    #    matvec = lambda v: eom.matvec(v, imds, diag)
-
-    #    if nmom is None:
-    #        nmom = 2 * self.nmom[1] + 2
-    #    moms = np.zeros((nmom, self.nmo, self.nmo))
-
-    #    bras = [None] * self.nmo
-    #    for p in range(self.nmo):
-    #        r1, r2 = self.get_e_part(p)
-    #        bras[p] = eom.amplitudes_to_vector(r1, r2)
-
-    #    for p in mpi_helper.nrange(self.nmo):
-    #        r1, r2 = self.get_b_part(p)
-    #        ket = eom.amplitudes_to_vector(r1, r2)
-
-    #        for n in range(nmom):
-    #            for q in range(self.nmo):
-    #                bra = bras[q]
-    #                moms[n, p, q] += np.dot(bra, ket)
-
-    #            if (n+1) != nmom:
-    #                ket = matvec(ket)
-
-    #    mpi_helper.barrier()
-    #    moms = mpi_helper.allreduce(moms)
-
-    #    moms = 0.5 * (moms + moms.swapaxes(1, 2))
-
-    #    logger.timer(self, "EA-EOM-CCSD moments", *cput0)
-
-    #    return moms
 
     def eigh_moments(self, t, nmom):
         """Block tridiagonalise the matrix under the constraint of
@@ -604,10 +517,10 @@ class GFCCSD(lib.StreamObject):
 
         m, b = block_lanczos(t, nmom)
         h_tri = build_block_tridiagonal(m, b)
-        bi = mat_sqrt(t[0])
+        bi = mat_sqrt(t[0]) / np.sqrt(2.0)
 
         e, u = np.linalg.eigh(h_tri)
-        u = np.dot(bi.T.conj(), u[:self.nmo])
+        u = np.dot(bi, u[:self.nmo])
 
         return e, u
 
