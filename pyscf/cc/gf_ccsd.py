@@ -29,6 +29,12 @@ def kernel(gfccsd, th=None, tp=None, eris=None):
         t1 = np.einsum("xk,yk,k->xy", v_left_ip, v_right_ip.conj(), e_ip**n)
         t1_scaled = t1 / np.max(np.abs(t1))
         t0_scaled = th[n] / np.max(np.abs(th[n]))
+
+        imag = np.max(np.abs(t1_scaled.imag))
+        if imag > 1e-8:
+            logger.warn(gfccsd, "Large imaginary part in recovered hole "
+                                "moment %d: %10.6g", n, imag)
+
         err = np.max(np.abs(t0_scaled - t1_scaled))
         (logger.note if err < 1e-8 else logger.warn)(
                 gfccsd, "Scaled error in hole moment %d: %10.6g", n, err)
@@ -46,6 +52,12 @@ def kernel(gfccsd, th=None, tp=None, eris=None):
         t1 = np.einsum("xk,yk,k->xy", v_left_ea, v_right_ea.conj(), e_ea**n)
         t1_scaled = t1 / np.max(np.abs(t1))
         t0_scaled = tp[n] / np.max(np.abs(tp[n]))
+
+        imag = np.max(np.abs(t1_scaled.imag))
+        if imag > 1e-8:
+            logger.warn(gfccsd, "Large imaginary part in recovered particle "
+                                "moment %d: %10.6g", n, imag)
+
         err = np.max(np.abs(t0_scaled - t1_scaled))
         (logger.note if err < 1e-8 else logger.warn)(
                 gfccsd, "Scaled error in particle moment %d: %10.6g", n, err)
@@ -173,7 +185,7 @@ def block_lanczos(t, nmom):
     a = np.zeros((nmom+1, nmo, nmo), dtype=dtype)
     b = np.zeros((nmom, nmo, nmo), dtype=dtype)
     c = np.zeros((nmom, nmo, nmo), dtype=dtype)
-    s = np.zeros((2*nmom+2, nmo, nmo), dtype=dtype)
+    s = np.zeros((len(t), nmo, nmo), dtype=dtype)
     v = defaultdict(lambda: np.zeros((nmo, nmo), dtype=dtype))
     w = defaultdict(lambda: np.zeros((nmo, nmo), dtype=dtype))
     v[0, 0] = np.eye(nmo).astype(dtype)
@@ -209,6 +221,19 @@ def block_lanczos(t, nmom):
 
         # Compute V_{i,n}
         for j in range(i+2):
+            #tmp = (
+            #    + v[i, j-1]
+            #    - np.dot(v[i, j], a[i])
+            #    - np.dot(v[i-1, j], c[i-1])
+            #)
+            #v[i+1, j] = np.dot(tmp, binv)
+            #tmp = (
+            #    + w[i, j-1]
+            #    - np.dot(a[i], w[i, j])
+            #    - np.dot(b[i-1], w[i-1, j])
+            #)
+            #w[i+1, j] = np.dot(cinv, tmp)
+
             tmp = (
                 + v[i, j-1]
                 - np.dot(v[i, j], a[i])
