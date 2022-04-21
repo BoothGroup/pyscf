@@ -4,11 +4,12 @@ moments of the similarity-transformed Hamiltonian.
 """
 
 import numpy as np
+import scipy.linalg
 from collections import defaultdict
 
-from pyscf import lib, cc
+from pyscf import lib, cc, ao2mo
 from pyscf.lib import logger
-from pyscf.agf2 import mpi_helper, chempot, GreensFunction
+from pyscf.agf2 import mpi_helper
 
 
 def kernel(gfccsd, th=None, tp=None, eris=None):
@@ -27,17 +28,16 @@ def kernel(gfccsd, th=None, tp=None, eris=None):
 
     for n in range(2*gfccsd.nmom[0]+2):
         t1 = np.einsum("xk,yk,k->xy", v_left_ip, v_right_ip.conj(), e_ip**n)
-        t1_scaled = t1 / np.max(np.abs(t1))
+        t1_scaled = t1 / np.max(np.abs(th[n]))
         t0_scaled = th[n] / np.max(np.abs(th[n]))
 
         imag = np.max(np.abs(t1_scaled.imag))
         if imag > 1e-8:
-            logger.warn(gfccsd, "Large imaginary part in recovered hole "
+            logger.info(gfccsd, "Large imaginary part in recovered hole "
                                 "moment %d: %10.6g", n, imag)
 
         err = np.max(np.abs(t0_scaled - t1_scaled))
-        (logger.note if err < 1e-8 else logger.warn)(
-                gfccsd, "Scaled error in hole moment %d: %10.6g", n, err)
+        logger.info(gfccsd, "Scaled error in hole moment %d: %10.6g", n, err)
 
     # We have actually solved for occupied quasiparticle states, flip sign:
     e_ip *= -1
@@ -48,19 +48,18 @@ def kernel(gfccsd, th=None, tp=None, eris=None):
     v_left_ea = np.dot(bp, up[:gfccsd.nmo])
     v_right_ea = np.dot(np.linalg.inv(up)[:, :gfccsd.nmo], bp).T.conj()
 
-    for n in range(2*gfccsd.nmom[0]+2):
+    for n in range(2*gfccsd.nmom[1]+2):
         t1 = np.einsum("xk,yk,k->xy", v_left_ea, v_right_ea.conj(), e_ea**n)
         t1_scaled = t1 / np.max(np.abs(t1))
         t0_scaled = tp[n] / np.max(np.abs(tp[n]))
 
         imag = np.max(np.abs(t1_scaled.imag))
         if imag > 1e-8:
-            logger.warn(gfccsd, "Large imaginary part in recovered particle "
+            logger.info(gfccsd, "Large imaginary part in recovered particle "
                                 "moment %d: %10.6g", n, imag)
 
         err = np.max(np.abs(t0_scaled - t1_scaled))
-        (logger.note if err < 1e-8 else logger.warn)(
-                gfccsd, "Scaled error in particle moment %d: %10.6g", n, err)
+        logger.info(gfccsd, "Scaled error in particle moment %d: %10.6g", n, err)
 
     # Eigenvalues are complex, sort them by their real part:
     mask = np.argsort(e_ip.real)
@@ -152,6 +151,56 @@ def _kernel_dynamic(gfccsd, grid, eta=1e-2, eris=None, conv_tol=1e-8):
     return gf
 
 
+def get_ip_rdm_moments(gfccsd, rdm1=None, rdm2=None):
+    """Get the zeroth- and first-order occupied moments via the first-
+    and second-order reduced density matrices.
+    """
+
+    if rdm1 is None:
+        rdm1 = gfccsd._cc.make_rdm1(l1=gfccsd.l1, l2=gfccsd.l2, ao_repr=False)
+    if rdm2 is None:
+        rdm2 = gfccsd._cc.make_rdm2(l1=gfccsd.l1, l2=gfccsd.l2, ao_repr=False)
+
+    mf = gfccsd._cc._scf
+    h1e = np.linalg.multi_dot((mf.mo_coeff.T.conj(), mf.get_hcore(), mf.mo_coeff))
+    h2e = ao2mo.incore.full(mf._eri, mf.mo_coeff, compact=False)
+    h2e = h2e.reshape((mf.mo_occ.size,) * 4)
+
+    t0 = rdm1.copy()
+
+    t1 =  lib.einsum("jk,ik->ij", h1e, rdm1)
+    t1 += lib.einsum("jklm,iklm->ij", h2e, rdm2)
+
+    return np.array([t0, t1])
+
+
+def get_ea_rdm_moments(gfccsd, rdm1=None, rdm2=None):
+    """Get the zeroth- and first-order occupied moments via the first-
+    and second-order reduced density matrices.
+    """
+
+    if rdm1 is None:
+        rdm1 = gfccsd._cc.make_rdm1(l1=gfccsd.l1, l2=gfccsd.l2, ao_repr=False)
+    if rdm2 is None:
+        rdm2 = gfccsd._cc.make_rdm2(l1=gfccsd.l1, l2=gfccsd.l2, ao_repr=False)
+
+    mf = gfccsd._cc._scf
+    h1e = np.linalg.multi_dot((mf.mo_coeff.conj().T, mf.get_hcore(), mf.mo_coeff))
+    h2e = ao2mo.incore.full(mf._eri, mf.mo_coeff, compact=False)
+    h2e = h2e.reshape((mf.mo_occ.size,) * 4)
+
+    rdm2_full =  lib.einsum("kl,jb->bjkl", rdm1, np.eye(gfccsd.nmo)) * 2.0
+    rdm2_full -= lib.einsum("kj,bl->bjkl", rdm1, np.eye(gfccsd.nmo))
+    rdm2_full -= lib.einsum("bjkl->blkj", rdm2)
+
+    t0 = np.eye(gfccsd.nmo) * 2.0 - rdm1
+
+    t1 =  lib.einsum("aj,jb->ab", h1e, rdm1)
+    t1 += lib.einsum("jklm,iklm->ij", h2e, rdm2_full)
+
+    return np.array([t0, t1])
+
+
 def mat_sqrt(m):
     """Square root a matrix.
     """
@@ -161,23 +210,25 @@ def mat_sqrt(m):
     return np.dot(v * w[None]**(0.5+0j), np.linalg.inv(v))
 
 
-def mat_isqrt(m, check_null_space=False, tol=1e-14):
+def mat_isqrt(m, check_null_space=False, tol=1e-16):
     """Inverse square root of the non-null-space of a matrix.
     """
 
     w, v = np.linalg.eig(m)
     vinv = np.linalg.inv(v)
 
-    mask = w != 0
+    mask = np.abs(w) > tol
     w, v = w[mask], v[:, mask]
     vinv = vinv[mask]
 
-    return np.dot(v * w[None]**-(0.5+0j), vinv)
+    return np.dot(v * w[None]**(-0.5+0j), vinv)
 
 
-def block_lanczos(t, nmom):
+def block_lanczos(gfccsd, t, nmom, verbose=None):
     """Compute the on- and off-diagonal blocks from the non-Hermitian moments.
     """
+
+    log = logger.new_logger(gfccsd, verbose)
 
     nmo = t[0].shape[-1]
     dtype = np.complex128
@@ -185,28 +236,49 @@ def block_lanczos(t, nmom):
     a = np.zeros((nmom+1, nmo, nmo), dtype=dtype)
     b = np.zeros((nmom, nmo, nmo), dtype=dtype)
     c = np.zeros((nmom, nmo, nmo), dtype=dtype)
-    s = np.zeros((len(t), nmo, nmo), dtype=dtype)
+    torth = np.zeros((len(t), nmo, nmo), dtype=dtype)
+    s = {}
+    r = {}
     v = defaultdict(lambda: np.zeros((nmo, nmo), dtype=dtype))
     w = defaultdict(lambda: np.zeros((nmo, nmo), dtype=dtype))
     v[0, 0] = np.eye(nmo).astype(dtype)
     w[0, 0] = np.eye(nmo).astype(dtype)
 
+    eigvals = np.linalg.eigvals(t[0])
+    log.info("Smallest eigenvalue of T[0]:  %.12g", np.min(np.abs(eigvals)))
+    log.info("Largest imaginary part of T[0] eigenvalues:  %.12g", np.max(np.abs(eigvals.imag)))
+
     bi = mat_isqrt(t[0])
 
-    for i in range(len(t)):
-        s[i] = np.linalg.multi_dot((bi, t[i], bi))
+    def matrix_info(x):
+        xnorm = np.abs(np.einsum("pq,qp->", x, x))
+        eigvals = np.linalg.eigvals(x)
+        mineig = np.min(np.abs(eigvals))
+        maxeig = np.max(np.abs(eigvals))
+        return xnorm, mineig, maxeig
 
-    a[0] = s[1]
+    log.info("Raw moments:")
+    for i in range(len(t)):
+        log.info("  T[%d]:    norm=%.12g  min(|eig|)=%.12g  max(|eig|)=%.12g", i, *matrix_info(t[i]))
+
+    log.info("Orthogonalised moments:")
+    for i in range(len(t)):
+        torth[i] = np.linalg.multi_dot((bi, t[i], bi))
+        log.info("  S[%d]:    norm=%.12g  min(|eig|)=%.12g  max(|eig|)=%.12g", i, *matrix_info(torth[i]))
+
+    a[0] = torth[1]
 
     for i in range(nmom):
+        log.info("Iteration %d", i)
+
         # Compute B_{i} and C_{i}
         b2 = np.zeros((nmo, nmo), dtype=dtype)
         c2 = np.zeros((nmo, nmo), dtype=dtype)
 
         for j in range(i+2):
             for l in range(i+1):
-                b2 += np.linalg.multi_dot((w[i, l], s[j+l+1], v[i, j-1]))
-                c2 += np.linalg.multi_dot((w[i, j-1], s[j+l+1], v[i, l]))
+                b2 += np.linalg.multi_dot((w[i, l], torth[j+l+1], v[i, j-1]))
+                c2 += np.linalg.multi_dot((w[i, j-1], torth[j+l+1], v[i, l]))
 
         b2 -= np.dot(a[i], a[i])
         c2 -= np.dot(a[i], a[i])
@@ -216,40 +288,130 @@ def block_lanczos(t, nmom):
 
         b[i] = mat_sqrt(b2)
         c[i] = mat_sqrt(c2)
+
         binv = mat_isqrt(b2)
         cinv = mat_isqrt(c2)
 
-        # Compute V_{i,n}
-        for j in range(i+2):
-            #tmp = (
-            #    + v[i, j-1]
-            #    - np.dot(v[i, j], a[i])
-            #    - np.dot(v[i-1, j], c[i-1])
-            #)
-            #v[i+1, j] = np.dot(tmp, binv)
-            #tmp = (
-            #    + w[i, j-1]
-            #    - np.dot(a[i], w[i, j])
-            #    - np.dot(b[i-1], w[i-1, j])
-            #)
-            #w[i+1, j] = np.dot(cinv, tmp)
+        log.info("  B[%d]^2:  norm=%.12g  min(|eig|)=%.12g  max(|eig|)=%.12g", i, *matrix_info(b2))
+        log.info("  C[%d]^2:  norm=%.12g  min(|eig|)=%.12g  max(|eig|)=%.12g", i, *matrix_info(c2))
+        log.info("  B[%d]:    norm=%.12g  min(|eig|)=%.12g  max(|eig|)=%.12g", i, *matrix_info(b[i]))
+        log.info("  C[%d]:    norm=%.12g  min(|eig|)=%.12g  max(|eig|)=%.12g", i, *matrix_info(c[i]))
+        log.info("  B[%d]^-1: norm=%.12g", i, matrix_info(binv)[0])
+        log.info("  C[%d]^-1: norm=%.12g", i, matrix_info(cinv)[0])
 
-            tmp = (
+        for j in range(i+2):
+            # Compute R
+            r[j] = (
                 + v[i, j-1]
                 - np.dot(v[i, j], a[i])
                 - np.dot(v[i-1, j], b[i-1])
             )
-            v[i+1, j] = np.dot(tmp, cinv)
-            tmp = (
+
+            # Compute S
+            s[j] = (
                 + w[i, j-1]
                 - np.dot(a[i], w[i, j])
                 - np.dot(c[i-1], w[i-1, j])
             )
-            w[i+1, j] = np.dot(binv, tmp)
+
+        if gfccsd.biorthogonalise:
+            #for j in range(i):
+            #    # Biorthogonalise R = R - V^{j} (W^{j} R)
+            #    wr = 0
+            #    for k in range(i+2):
+            #        for l in range(i+2):
+            #            wr += np.linalg.multi_dot((w[j, k], torth[k+l], r[l]))
+            #    for k in range(i+2):
+            #        r[k] -= np.dot(v[j, k], wr)
+
+            #    # Biorthogonalise S = S - (W^{j} V^{j}) S
+            #    wv = 0
+            #    for k in range(i+2):
+            #        for l in range(i+2):
+            #            wv += np.linalg.multi_dot((w[j, k], torth[k+l], v[j, l]))
+            #    for k in range(i+2):
+            #        s[k] -= np.dot(wv, s[k])
+
+            pass
 
         for j in range(i+2):
+            # Compute V^{i+1}
+            v[i+1, j] = np.dot(r[j], cinv)
+
+            # Compute W^{i+1}
+            w[i+1, j] = np.dot(binv, s[j])
+
+        if gfccsd.biorthogonalise:
+            ## Biorthogonalise W and V
+            #for k in range(i+1):
+            #    # V^{j} = V^{j} - V^{k} (W^{k} V^{j})
+            #    wv = 0
+            #    for m in range(i+2):
+            #        for l in range(i+2):
+            #            wv += np.linalg.multi_dot((w[k, m], torth[m+l], v[i+1, l]))
+            #    for m in range(i+2):
+            #        v[i+1, m] -= np.dot(v[k, m], wv)
+
+            #    # W^{j} = W^{j} - (W^{k} V^{k}) W^{j}
+            #    wv = 0
+            #    for m in range(i+2):
+            #        for l in range(i+2):
+            #            wv += np.linalg.multi_dot((w[k, m], torth[m+l], v[k, l]))
+            #    for m in range(i+2):
+            #        w[i+1, m] -= np.dot(wv, w[i+1, m])
+
+
+            inner_prod = np.zeros((nmo*(i+2), nmo*(i+2)), dtype=dtype)
+            for n in range(i+2):
+                ns = slice(n*nmo, (n+1)*nmo)
+                for m in range(i+2):
+                    ms = slice(m*nmo, (m+1)*nmo)
+                    for k in range(i+2):
+                        for l in range(i+2):
+                            if (n, k) in w and (m, l) in v:
+                                inner_prod[ns, ms] += np.linalg.multi_dot((w[n, k], torth[k+l], v[m, l]))
+
+            lu = np.block(inner_prod)
+            l, u = scipy.linalg.lu(lu, permute_l=True)
+
+            linv = np.linalg.inv(l)
+            uinv = np.linalg.inv(u)
+
+            vnew = defaultdict(lambda: np.zeros((nmo, nmo), dtype=dtype))
+            wnew = defaultdict(lambda: np.zeros((nmo, nmo), dtype=dtype))
+
+            for n in range(i+2):
+                ns = slice(n*nmo, (n+1)*nmo)
+                for j in range(i+2):
+                    js = slice(j*nmo, (j+1)*nmo)
+                    if (n, j) in w:
+                        wnew[n, j] = np.dot(linv[ns, js], w[n, j])
+                    if (n, j) in v:
+                        vnew[n, j] = np.dot(v[n, j], uinv[ns, js])
+
+            w, v = wnew, vnew
+
+
+        # Compute A[i+1]
+        for j in range(i+2):
             for l in range(i+2):
-                a[i+1] += np.linalg.multi_dot((w[i+1, l], s[j+l+1], v[i+1, j]))
+                a[i+1] += np.linalg.multi_dot((w[i+1, l], torth[j+l+1], v[i+1, j]))
+
+        log.info("  A[%d]:    norm=%.12g  min(|eig|)=%.12g  max(|eig|)=%.12g", i+1, *matrix_info(a[i+1]))
+
+        log.info("  Error in biorthogonal vector pairs:")
+        for j in range(i+2):
+            orth = np.zeros((nmo, nmo), dtype=dtype)
+            for k in range(i+2):
+                for l in range(i+2):
+                    orth += np.linalg.multi_dot((w[i+1, l], torth[k+l], v[j, k]))
+            log.info("    W[%d] * V[%d]:  %.12g", i+1, j, np.max(np.abs(orth - np.eye(nmo) * ((i+1) == j))))
+        for j in range(i+2):
+            orth = np.zeros((nmo, nmo), dtype=dtype)
+            for k in range(i+2):
+                for l in range(i+2):
+                    orth += np.linalg.multi_dot((w[j, l], torth[k+l], v[i+1, k]))
+            log.info("    W[%d] * V[%d]:  %.12g", j, i+1, np.max(np.abs(orth - np.eye(nmo) * ((i+1) == j))))
 
     return a, b, c
 
@@ -398,6 +560,8 @@ class GFCCSD(lib.StreamObject):
         else:
             self.nmom = nmom
         self.weight_tol = 1e-1
+        self.biorthogonalise = False
+        self.rdm_moments = False
         self.e_ip = None
         self.v_ip = None
         self.e_ea = None
@@ -417,6 +581,7 @@ class GFCCSD(lib.StreamObject):
         log.info("nmo = %s", self.nmo)
         log.info("nocc = %s", self.nocc)
         log.info("weight_tol = %s", self.weight_tol)
+        log.info("rdm_moments = %s", self.rdm_moments)
         log.info("chkfile = %s", self.chkfile)
 
     def _finalize(self):
@@ -468,6 +633,14 @@ class GFCCSD(lib.StreamObject):
         """Get the moments of the IP-EOM-CCSD Green's function.
         """
 
+        if nmom is None:
+            nmom = 2 * self.nmom[0] + 2
+        moms = np.zeros((nmom, self.nmo, self.nmo))
+
+        if self.rdm_moments:
+            assert nmom == 2
+            return get_ip_rdm_moments(self)
+
         cput0 = (logger.process_clock(), logger.perf_counter())
 
         eom = self.eomip_method()
@@ -479,10 +652,6 @@ class GFCCSD(lib.StreamObject):
             matvec.count += 1
             return -eom.l_matvec(v, imds, diag)
         matvec.count = 0
-
-        if nmom is None:
-            nmom = 2 * self.nmom[0] + 2
-        moms = np.zeros((nmom, self.nmo, self.nmo))
 
         bras = [None] * self.nmo
         for p in range(self.nmo):
@@ -513,6 +682,14 @@ class GFCCSD(lib.StreamObject):
         """Get the moments of the EA-EOM-CCSD Green's function.
         """
 
+        if nmom is None:
+            nmom = 2 * self.nmom[1] + 2
+        moms = np.zeros((nmom, self.nmo, self.nmo))
+
+        if self.rdm_moments:
+            assert nmom == 2
+            return get_ea_rdm_moments(self)
+
         cput0 = (logger.process_clock(), logger.perf_counter())
 
         eom = self.eomea_method()
@@ -524,10 +701,6 @@ class GFCCSD(lib.StreamObject):
             matvec.count += 1
             return eom.l_matvec(v, imds, diag)
         matvec.count = 0
-
-        if nmom is None:
-            nmom = 2 * self.nmom[1] + 2
-        moms = np.zeros((nmom, self.nmo, self.nmo))
 
         bras = [None] * self.nmo
         for p in range(self.nmo):
@@ -560,7 +733,7 @@ class GFCCSD(lib.StreamObject):
         the block tridiagonal matrix.
         """
 
-        a, b, c = block_lanczos(t, nmom)
+        a, b, c = block_lanczos(self, t, nmom)
         h_tri = build_block_tridiagonal(a, b, c)
         e, u = np.linalg.eig(h_tri)
         bi = mat_sqrt(t[0])
@@ -678,7 +851,7 @@ class GFCCSD(lib.StreamObject):
         e_ip = self.e_ip[mask]
         v_ip_l, v_ip_r = v_ip_l[:, mask], v_ip_r[:, mask]
 
-        nroots = max(nroots, len(e_ip))
+        nroots = min(nroots, len(e_ip))
 
         e_ip = e_ip[:nroots]
         v_ip_l = list(v_ip_l[:, :nroots].T)
@@ -706,7 +879,7 @@ class GFCCSD(lib.StreamObject):
         e_ea = e_ea[mask]
         v_ea_l, v_ea_r = v_ea_l[:, mask], v_ea_r[:, mask]
 
-        nroots = max(nroots, len(e_ea))
+        nroots = min(nroots, len(e_ea))
 
         e_ea = e_ea[:nroots]
         v_ea_l = list(v_ea_l[:, :nroots].T)
@@ -757,4 +930,3 @@ if __name__ == "__main__":
     print(np.abs(ip1[1]-ip2[1]))
     print(np.abs(ea1[0]-ea2[0]))
     print(np.abs(ea1[1]-ea2[1]))
-
