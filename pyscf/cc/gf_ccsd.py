@@ -171,7 +171,7 @@ def get_ip_rdm_moments(gfccsd, rdm1=None, rdm2=None):
     t1 =  lib.einsum("jk,ik->ij", h1e, rdm1)
     t1 += lib.einsum("jklm,iklm->ij", h2e, rdm2)
 
-    return np.array([t0, t1])
+    return np.array([t0, t1]) / 2.0
 
 
 def get_ea_rdm_moments(gfccsd, rdm1=None, rdm2=None):
@@ -198,7 +198,7 @@ def get_ea_rdm_moments(gfccsd, rdm1=None, rdm2=None):
     t1 =  lib.einsum("aj,jb->ab", h1e, rdm1)
     t1 += lib.einsum("jklm,iklm->ij", h2e, rdm2_full)
 
-    return np.array([t0, t1])
+    return np.array([t0, t1]) / 2.0
 
 
 def mat_sqrt(m):
