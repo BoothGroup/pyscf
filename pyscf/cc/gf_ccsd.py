@@ -125,8 +125,6 @@ def _kernel_dynamic(gfccsd, grid, eta=1e-2, eris=None, conv_tol=1e-8):
         mpi_helper.barrier()
         gf = mpi_helper.allreduce(gf)
 
-        gf = 0.5 * (gf + gf.swapaxes(1, 2)).conj()
-
         calls[matvec] = mpi_helper.allreduce(matvec_dynamic.count)
 
         return gf
@@ -168,7 +166,7 @@ def get_ip_rdm_moments(gfccsd, rdm1=None, rdm2=None):
 
     t0 = rdm1.copy()
 
-    t1 =  lib.einsum("jk,ik->ij", h1e, rdm1)
+    t1 =  lib.einsum("jk,ik->ij", h1e, t0)
     t1 += lib.einsum("jklm,iklm->ij", h2e, rdm2)
 
     return np.array([t0, t1]) / 2.0
@@ -195,8 +193,8 @@ def get_ea_rdm_moments(gfccsd, rdm1=None, rdm2=None):
 
     t0 = np.eye(gfccsd.nmo) * 2.0 - rdm1
 
-    t1 =  lib.einsum("aj,jb->ab", h1e, rdm1)
-    t1 += lib.einsum("jklm,iklm->ij", h2e, rdm2_full)
+    t1 =  lib.einsum("aj,jb->ab", h1e, t0)
+    t1 += lib.einsum("ajkl,bjkl->ab", h2e, rdm2_full)
 
     return np.array([t0, t1]) / 2.0
 
