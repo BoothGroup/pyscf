@@ -189,7 +189,8 @@ def get_ea_rdm_moments(gfccsd, rdm1=None, rdm2=None):
 
     rdm2_full =  lib.einsum("kl,jb->bjkl", rdm1, np.eye(gfccsd.nmo)) * 2.0
     rdm2_full -= lib.einsum("kj,bl->bjkl", rdm1, np.eye(gfccsd.nmo))
-    rdm2_full -= lib.einsum("bjkl->blkj", rdm2)
+    #rdm2_full -= lib.einsum("bjkl->blkj", rdm2)
+    rdm2_full -= rdm2
 
     t0 = np.eye(gfccsd.nmo) * 2.0 - rdm1
 
